@@ -223,36 +223,123 @@ Resources:
             systemctl start httpd
             systemctl enable httpd
 
-            # Configure Apache for CGI
-            echo "<Directory /var/www/cgi-bin>" >> /etc/httpd/conf/httpd.conf
-            echo "  Options +ExecCGI" >> /etc/httpd/conf/httpd.conf
-            echo "  AddHandler cgi-script .sh" >> /etc/httpd/conf/httpd.conf
-            echo "</Directory>" >> /etc/httpd/conf/httpd.conf
+            # Enable CGI module
+            sed -i 's/#LoadModule cgid_module/LoadModule cgid_module/' /etc/httpd/conf.modules.d/00-base.conf
 
+            # Configure Apache for CGI more completely
+            cat << EOF > /etc/httpd/conf.d/cgi.conf
+            ScriptAlias /cgi-bin/ "/var/www/cgi-bin/"
+            <Directory "/var/www/cgi-bin">
+                AllowOverride None
+                Options +ExecCGI
+                Require all granted
+                AddHandler cgi-script .sh
+            </Directory>
+            EOF
+
+            # Create necessary directories
             mkdir -p /var/www/cgi-bin
 
-            # Create stress script
-            echo '#!/bin/bash' > /var/www/cgi-bin/stress_cpu.sh
-            echo 'echo "Content-type: text/html"' >> /var/www/cgi-bin/stress_cpu.sh
-            echo 'echo ""' >> /var/www/cgi-bin/stress_cpu.sh
-            echo 'stress-ng --cpu 1 --timeout 60 &' >> /var/www/cgi-bin/stress_cpu.sh
-            echo 'echo "CPU stress started"' >> /var/www/cgi-bin/stress_cpu.sh
-            chmod +x /var/www/cgi-bin/stress_cpu.sh
+            # Create improved stress script
+            cat << 'EOF' > /var/www/cgi-bin/stress_cpu.sh
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            echo "<html><head><title>CPU Stress Test</title></head><body>"
+            echo "<h1>CPU Stress Started</h1>"
+            echo "<p>Running stress-ng with 1 CPU worker for 60 seconds</p>"
+            echo "<p>Current server time: $(date)</p>"
+            echo "<p>CPU info before stress:</p>"
+            echo "<pre>"
+            top -bn1 | head -20
+            echo "</pre>"
 
-            # Create index.html
-            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-            IP_ADDRESS=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+            # Run stress in background but capture PID
+            stress-ng --cpu 1 --timeout 60 &
+            STRESS_PID=$!
+
+            echo "<p>Stress process started with PID: $STRESS_PID</p>"
+            echo "<p><a href='/'>Return to homepage</a></p>"
+            echo "</body></html>"
+            EOF
+            chmod 755 /var/www/cgi-bin/stress_cpu.sh
+
+            # Create server status script
+            cat << 'EOF' > /var/www/cgi-bin/status.sh
+            #!/bin/bash
+            echo "Content-type: text/html"
+            echo ""
+            echo "<html><head><title>Server Status</title><meta http-equiv='refresh' content='5'></head><body>"
+            echo "<h1>Server Status</h1>"
+            echo "<p>Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id || echo 'Unknown')</p>"
+            echo "<p>IP Address: $(curl -s http://169.254.169.254/latest/meta-data/local-ipv4 || echo 'Unknown')</p>"
+            echo "<p>Current server time: $(date)</p>"
+            echo "<h2>CPU Usage</h2>"
+            echo "<pre>"
+            top -bn1 | head -20
+            echo "</pre>"
+            echo "<h2>Memory Usage</h2>"
+            echo "<pre>"
+            free -m
+            echo "</pre>"
+            echo "<p><a href='/'>Return to homepage</a></p>"
+            echo "</body></html>"
+            EOF
+            chmod 755 /var/www/cgi-bin/status.sh
+
+            # Get instance metadata with retries and timeout
+            retry_count=0
+            max_retries=5
+            
+            while [ $retry_count -lt $max_retries ]; do
+              INSTANCE_ID=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/instance-id)
+              IP_ADDRESS=$(curl -s --connect-timeout 5 http://169.254.169.254/latest/meta-data/local-ipv4)
+              
+              if [ -n "$INSTANCE_ID" ] && [ -n "$IP_ADDRESS" ]; then
+                break
+              fi
+              
+              echo "Metadata retrieval attempt $((retry_count+1)) failed, retrying in 5 seconds..."
+              sleep 5
+              retry_count=$((retry_count+1))
+            done
+            
+            # Use default values if retrieval fails after all retries
+            INSTANCE_ID=${INSTANCE_ID:-"Unknown-ID"}
+            IP_ADDRESS=${IP_ADDRESS:-"Unknown-IP"}
+
+            # Create improved index.html
             cat << EOF > /var/www/html/index.html
             <html>
+            <head>
+              <title>AWS Auto Scaling Demo</title>
+              <style>
+                body { font-family: Arial, sans-serif; margin: 40px; }
+                .info { background-color: #f0f0f0; padding: 20px; border-radius: 5px; }
+                button { background-color: #ff9900; border: none; color: white; padding: 10px 20px; 
+                         font-size: 16px; cursor: pointer; margin-right: 10px; }
+              </style>
+            </head>
             <body>
-            <h1>Hello from $IP_ADDRESS / $INSTANCE_ID</h1>
-            <form action="/cgi-bin/stress_cpu.sh" method="post">
-              <button type="submit">Stress CPU</button>
-            </form>
+              <h1>Auto Scaling Demo Server</h1>
+              <div class="info">
+                <h2>Server Information</h2>
+                <p>Instance ID: $INSTANCE_ID</p>
+                <p>IP Address: $IP_ADDRESS</p>
+              </div>
+              <h2>Actions</h2>
+              <form action="/cgi-bin/stress_cpu.sh" method="get">
+                <button type="submit">Stress CPU for 60 seconds</button>
+              </form>
+              <a href="/cgi-bin/status.sh"><button type="button">View Server Status</button></a>
             </body>
             </html>
             EOF
           
+            # Set appropriate permissions for web directory
+            chown -R apache:apache /var/www
+            
+            # Restart Apache to apply all changes
             systemctl restart httpd
 
   WebServerASG:
